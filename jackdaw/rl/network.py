@@ -351,6 +351,13 @@ class FactoredPolicy(nn.Module):
             # Dot-product scoring: content-based card selection
             card_logits = (q.unsqueeze(1) * hand_embeds).sum(-1) / (q.shape[-1] ** 0.5)
 
+            # Best-hand card bias: directly boost cards that form the best hand
+            # Feature 13 = is_best_hand_card, Feature 14 = n_matching_rank_peers
+            raw_hand = obs["hand_card"][idx]  # (n, max_hand, feat_dim)
+            is_best = raw_hand[:, :max_hand, 13]  # (n, max_hand)
+            n_peers = raw_hand[:, :max_hand, 14]  # (n, max_hand)
+            card_logits = card_logits + 2.0 * is_best + 1.0 * n_peers
+
             cmask = action_masks["card_mask"][idx]  # (n, max_hand) bool
             # Clamp logits before masking to prevent overflow
             card_logits = card_logits.clamp(-_CARD_LOGIT_CLAMP, _CARD_LOGIT_CLAMP)
@@ -492,6 +499,12 @@ class FactoredPolicy(nn.Module):
             hand_embeds = entity_embeds["hand_card"][idx]
             # Dot-product scoring: content-based card selection
             card_logits = (q.unsqueeze(1) * hand_embeds).sum(-1) / (q.shape[-1] ** 0.5)
+
+            # Best-hand card bias (same as forward)
+            raw_hand = obs["hand_card"][idx]
+            is_best = raw_hand[:, :max_hand, 13]
+            n_peers = raw_hand[:, :max_hand, 14]
+            card_logits = card_logits + 2.0 * is_best + 1.0 * n_peers
 
             cmask = action_masks["card_mask"][idx]
             # Ensure selected cards are in mask (handles stale masks)

@@ -1106,6 +1106,12 @@ def encode_playing_cards_batch(
     jokers: list[Card] = gs.get("jokers", [])
     _, _, scoring_ids = _compute_hand_analysis(cards, jokers, gs.get("hand_levels"))
 
+    # Count matching ranks for pair/trips detection (feature 14)
+    rank_counts: dict[int, int] = {}
+    for card in cards:
+        if card.base is not None and card.facing != "back":
+            rank_counts[card.base.id] = rank_counts.get(card.base.id, 0) + 1
+
     for i, card in enumerate(cards):
         row = buf[i]  # already zeroed
         face_down = card.facing == "back"
@@ -1131,6 +1137,7 @@ def encode_playing_cards_batch(
         row[11] = _log_scale(card.base.times_played)
         row[12] = i / 20.0
         row[13] = float(id(card) in scoring_ids)
+        row[14] = (rank_counts.get(card.base.id, 1) - 1) / 3.0  # n_matching_rank_peers
 
     # Return a copy so the buffer can be reused next call
     return buf.copy()
