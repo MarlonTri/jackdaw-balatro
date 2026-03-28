@@ -355,19 +355,16 @@ class FactoredBalatroEnv:
             elif chip_delta >= 10:
                 reward += 0.02  # basic pair
 
-        # Joker acquisition bonus: very strong signal for buying jokers
+        # Joker acquisition bonus: strong but balanced
         n_jokers = len(gs.get("jokers", []))
         if n_jokers > self._prev_joker_count:
             reward += 0.30 * (n_jokers - self._prev_joker_count)
-        # Joker possession bonus: ongoing reward for holding jokers
-        if n_jokers > 0:
-            reward += 0.002 * n_jokers
 
-        # Shop purchase bonus: reward spending money on items
+        # Shop purchase bonus: encourage spending on items
         dollars = gs.get("dollars", 0)
         if phase == GamePhase.SHOP and dollars < self._prev_dollars:
             money_spent = self._prev_dollars - dollars
-            reward += 0.03 * min(money_spent, 10)  # up to +0.30 for big purchases
+            reward += 0.05 * min(money_spent, 10)  # up to +0.50 for big purchases
 
         # Economy signal: gentle pull toward saving for interest
         if dollars >= 5:

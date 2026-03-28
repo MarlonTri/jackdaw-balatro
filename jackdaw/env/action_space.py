@@ -229,11 +229,6 @@ def get_action_mask(game_state: dict[str, Any]) -> ActionMask:
             type_mask[ActionType.PlayHand] = True
         if hand and cr.get("discards_left", 0) > 0:
             type_mask[ActionType.Discard] = True
-        if len(hand) > 1:
-            type_mask[ActionType.SortHandRank] = True
-            type_mask[ActionType.SortHandSuit] = True
-            _mask_hand_swaps(type_mask, entity_masks, hand)
-        _mask_joker_swaps(type_mask, entity_masks, jokers)
         _mask_consumables(type_mask, entity_masks, game_state)
 
     # --- ROUND_EVAL ---
@@ -257,7 +252,6 @@ def get_action_mask(game_state: dict[str, Any]) -> ActionMask:
             type_mask[ActionType.Reroll] = True
 
         type_mask[ActionType.NextRound] = True
-        _mask_joker_swaps(type_mask, entity_masks, jokers)
 
     # --- PACK_OPENING ---
     elif phase == GamePhase.PACK_OPENING:

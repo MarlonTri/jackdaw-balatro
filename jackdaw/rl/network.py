@@ -152,13 +152,8 @@ class FactoredPolicy(nn.Module):
             self.pointer_queries[name] = nn.Linear(STATE_EMBED, ENTITY_EMBED)
 
         # --- Card selection head ---
-        # query from state, score via MLP on concat(query, card_embed)
+        # Dot-product scoring: query · card_embed (content-based, no positional bias)
         self.card_query = nn.Linear(STATE_EMBED, ENTITY_EMBED)
-        self.card_score = nn.Sequential(
-            nn.Linear(ENTITY_EMBED * 2, ENTITY_EMBED),
-            nn.ReLU(),
-            nn.Linear(ENTITY_EMBED, 1),
-        )
 
         # --- Value head ---
         self.value_head = nn.Sequential(
@@ -353,9 +348,8 @@ class FactoredPolicy(nn.Module):
             max_hand = ENTITY_MAX_COUNTS[HAND_CARD_IDX]  # 8
             q = self.card_query(state[idx])  # (n, ENTITY_EMBED)
             hand_embeds = entity_embeds["hand_card"][idx]  # (n, max_hand, ENTITY_EMBED)
-            q_expanded = q.unsqueeze(1).expand(-1, max_hand, -1)  # (n, max_hand, ENTITY_EMBED)
-            cat_qk = torch.cat([q_expanded, hand_embeds], dim=-1)  # (n, max_hand, ENTITY_EMBED*2)
-            card_logits = self.card_score(cat_qk).squeeze(-1)  # (n, max_hand)
+            # Dot-product scoring: content-based card selection
+            card_logits = (q.unsqueeze(1) * hand_embeds).sum(-1) / (q.shape[-1] ** 0.5)
 
             cmask = action_masks["card_mask"][idx]  # (n, max_hand) bool
             # Clamp logits before masking to prevent overflow
@@ -496,9 +490,8 @@ class FactoredPolicy(nn.Module):
             max_hand = ENTITY_MAX_COUNTS[HAND_CARD_IDX]
             q = self.card_query(state[idx])
             hand_embeds = entity_embeds["hand_card"][idx]
-            q_expanded = q.unsqueeze(1).expand(-1, max_hand, -1)
-            cat_qk = torch.cat([q_expanded, hand_embeds], dim=-1)
-            card_logits = self.card_score(cat_qk).squeeze(-1)
+            # Dot-product scoring: content-based card selection
+            card_logits = (q.unsqueeze(1) * hand_embeds).sum(-1) / (q.shape[-1] ** 0.5)
 
             cmask = action_masks["card_mask"][idx]
             # Ensure selected cards are in mask (handles stale masks)
