@@ -49,8 +49,8 @@ D_GLOBAL = _SPEC.global_feature_dim  # 235
 
 # Encoder output dims
 GLOBAL_EMBED = 128
-ENTITY_EMBED = 64  # all entity types (unified for cross-attention)
-STATE_EMBED = 256
+ENTITY_EMBED = 96  # all entity types (unified for cross-attention)
+STATE_EMBED = 384
 
 POINTER_DIM = 64  # query/key dim for pointer attention
 
@@ -64,6 +64,7 @@ MAX_ENTITIES = sum(et.max_count for et in _SPEC.entity_types)  # 30
 # illegal positions are set to _MASK_VALUE.  _MASK_VALUE must be well below
 # -_LOGIT_CLAMP so masked positions can never be sampled.
 _LOGIT_CLAMP = 20.0
+_CARD_LOGIT_CLAMP = 3.0  # tighter clamp for sigmoid card head (prevents entropy collapse)
 _MASK_VALUE = -1e4  # exp(-1e4) == 0 in float32; safe from NaN unlike -1e8
 
 
@@ -358,7 +359,7 @@ class FactoredPolicy(nn.Module):
 
             cmask = action_masks["card_mask"][idx]  # (n, max_hand) bool
             # Clamp logits before masking to prevent overflow
-            card_logits = card_logits.clamp(-_LOGIT_CLAMP, _LOGIT_CLAMP)
+            card_logits = card_logits.clamp(-_CARD_LOGIT_CLAMP, _CARD_LOGIT_CLAMP)
             card_logits = card_logits.masked_fill(~cmask, _MASK_VALUE)
 
             # Independent Bernoulli per card
@@ -502,7 +503,7 @@ class FactoredPolicy(nn.Module):
             cmask = action_masks["card_mask"][idx]
             # Ensure selected cards are in mask (handles stale masks)
             cmask = cmask | card_target[idx]
-            card_logits = card_logits.clamp(-_LOGIT_CLAMP, _LOGIT_CLAMP)
+            card_logits = card_logits.clamp(-_CARD_LOGIT_CLAMP, _CARD_LOGIT_CLAMP)
             card_logits = card_logits.masked_fill(~cmask, _MASK_VALUE)
 
             card_probs = torch.sigmoid(card_logits)
@@ -522,9 +523,8 @@ class FactoredPolicy(nn.Module):
         value = self.value_head(state).squeeze(-1)
 
         total_lp = type_lp + entity_lp + card_lp
-        total_entropy = type_entropy + card_entropy
 
-        return total_lp, value, total_entropy
+        return total_lp, value, type_entropy, card_entropy
 
     # ------------------------------------------------------------------
     # Helpers

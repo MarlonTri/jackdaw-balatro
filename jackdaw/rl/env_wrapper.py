@@ -210,15 +210,17 @@ class FactoredBalatroEnv:
         )
         self._reward_shaping = reward_shaping
         self._shop_splits: tuple[int, int, int] = (0, 0, 0)
-        self.max_episode_steps = 200
+        self.max_episode_steps = 400
         self._step_count = 0
 
         # Reward-shaping trackers
         self._prev_ante: int = 1
         self._prev_round: int = 0
         self._prev_chips: int = 0
+        self._prev_dollars: int = 0
         self._episode_max_ante: int = 1
         self._episode_max_round: int = 0
+        self._prev_joker_count: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -231,8 +233,10 @@ class FactoredBalatroEnv:
         self._prev_ante = self._inner.episode_ante
         self._prev_round = 0
         self._prev_chips = 0
+        self._prev_dollars = 0
         self._episode_max_ante = 1
         self._episode_max_round = 0
+        self._prev_joker_count = 0
         self._shop_splits = info.get("shop_splits", (0, 0, 0))
         game_mask = _remap_shop_masks(game_mask, self._shop_splits)
         obs = self._build_obs(game_obs)
@@ -316,6 +320,9 @@ class FactoredBalatroEnv:
 
         gs: dict[str, Any] = info.get("raw_state", {})
 
+        # Base step cost (uniform — shop exploration is valuable)
+        from jackdaw.engine.actions import GamePhase
+        phase = gs.get("phase")
         reward = -0.001
 
         ante = gs.get("round_resets", {}).get("ante", 1)
@@ -323,33 +330,57 @@ class FactoredBalatroEnv:
         chips = gs.get("chips", 0)
 
         if round_num > self._prev_round:
-            reward += 0.15 * max(ante / 4, 0.5)
+            reward += 0.25 * max(ante / 4, 0.5)
             if ante > self._prev_ante:
-                reward += 0.2 * ante
+                reward += 0.3 * ante
             hands_left = gs.get("current_round", {}).get("hands_left", 0)
-            reward += 0.01 * hands_left
+            reward += 0.03 * hands_left
 
         blind = gs.get("blind")
         blind_target = getattr(blind, "chips", 0) if blind is not None else 0
         if blind_target > 0 and chips > self._prev_chips:
             chip_delta = chips - self._prev_chips
             progress = chip_delta / blind_target
-            reward += 0.02 * min(progress, 1.0)
+            reward += 0.10 * min(progress, 1.0)
             # Over-clearing bonus: reward high-scoring hands
             if progress > 1.0:
-                reward += 0.01 * min(progress - 1.0, 3.0)
+                reward += 0.05 * min(progress - 1.0, 3.0)
+            # Hand quality bonus: graduated reward for stronger poker hands
+            if chip_delta >= 200:
+                reward += 0.15  # flush, full house, or better
+            elif chip_delta >= 80:
+                reward += 0.08  # three of a kind, straight
+            elif chip_delta >= 30:
+                reward += 0.04  # two pair, good pair
+            elif chip_delta >= 10:
+                reward += 0.02  # basic pair
+
+        # Joker acquisition bonus: very strong signal for buying jokers
+        n_jokers = len(gs.get("jokers", []))
+        if n_jokers > self._prev_joker_count:
+            reward += 0.30 * (n_jokers - self._prev_joker_count)
+        # Joker possession bonus: ongoing reward for holding jokers
+        if n_jokers > 0:
+            reward += 0.002 * n_jokers
+
+        # Shop purchase bonus: reward spending money on items
+        dollars = gs.get("dollars", 0)
+        if phase == GamePhase.SHOP and dollars < self._prev_dollars:
+            money_spent = self._prev_dollars - dollars
+            reward += 0.03 * min(money_spent, 10)  # up to +0.30 for big purchases
 
         # Economy signal: gentle pull toward saving for interest
-        dollars = gs.get("dollars", 0)
         if dollars >= 5:
             reward += 0.001 * min(dollars // 5, 5)
 
         if terminated or truncated:
-            reward += 0.5 if self._inner.episode_won else -0.2
+            reward += 1.0 if self._inner.episode_won else -0.3
 
         self._prev_round = round_num
         self._prev_ante = ante
         self._prev_chips = chips
+        self._prev_dollars = dollars
+        self._prev_joker_count = n_jokers
         self._episode_max_ante = max(self._episode_max_ante, ante)
         self._episode_max_round = max(self._episode_max_round, round_num)
 

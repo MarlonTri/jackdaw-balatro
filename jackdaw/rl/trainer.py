@@ -138,6 +138,7 @@ class BalatroTrainer:
         clip_range: float = 0.15,
         ent_coef: float = 0.2,
         entropy_target: float = 2.0,
+        card_ent_coef: float = 0.02,
         vf_coef: float = 0.5,
         n_steps: int = 4096,
         n_epochs: int = 10,
@@ -156,6 +157,7 @@ class BalatroTrainer:
         self.clip_range = clip_range
         self.ent_coef = ent_coef
         self.entropy_target = entropy_target
+        self.card_ent_coef = card_ent_coef
         self.vf_coef = vf_coef
         self.n_steps = n_steps
         self.n_epochs = n_epochs
@@ -328,6 +330,8 @@ class BalatroTrainer:
         total_max_ratio = 0.0
         total_lr_clipped_frac = 0.0
         total_entropy_deviation = 0.0
+        total_type_entropy = 0.0
+        total_card_entropy = 0.0
         n_batches = 0
 
         for start in range(0, N, self.batch_size):
@@ -359,7 +363,7 @@ class BalatroTrainer:
             adv_b = (adv_b - adv_b.mean()) / (adv_b.std() + 1e-8)
 
             # Re-evaluate
-            new_lp, new_val, entropy = self.network.evaluate(obs_b, masks_b, at_b, et_b, ct_b)
+            new_lp, new_val, type_entropy, card_entropy = self.network.evaluate(obs_b, masks_b, at_b, et_b, ct_b)
 
             # NaN guard — skip batch if network produced NaN
             if torch.isnan(new_lp).any() or torch.isnan(new_val).any():
@@ -382,9 +386,32 @@ class BalatroTrainer:
             value_loss_clipped = (value_clipped - ret_b).pow(2)
             value_loss = torch.max(value_loss_unclipped, value_loss_clipped).mean()
 
-            # Entropy targeting — pull entropy toward target from both directions
-            entropy_mean = entropy.mean()
-            entropy_loss = self.ent_coef * (entropy_mean - self.entropy_target).pow(2)
+            # Adaptive entropy targeting in log-space (stronger gradient near collapse)
+            # Type entropy: target ratio of max possible entropy
+            n_available = masks_b["type_mask"].sum(dim=-1).float().clamp(min=2)
+            max_type_ent = torch.log(n_available)
+            type_target = self.entropy_target * max_type_ent
+            log_type_ent = torch.log(type_entropy.clamp(min=0.01))
+            log_type_target = torch.log(type_target.clamp(min=0.01))
+            type_ent_loss = self.ent_coef * (log_type_ent - log_type_target).pow(2).mean()
+
+            # Card entropy: same log-space targeting for card-action samples
+            is_card_action = torch.zeros(len(at_b), dtype=torch.bool, device=self.device)
+            for a in NEEDS_CARDS:
+                is_card_action |= (at_b == a)
+            if is_card_action.any():
+                n_valid = masks_b["card_mask"][is_card_action].sum(dim=-1).float().clamp(min=1)
+                max_card_ent = n_valid * 0.693  # ln(2) per card
+                card_target = self.entropy_target * max_card_ent
+                actual_ce = card_entropy[is_card_action]
+                log_ce = torch.log(actual_ce.clamp(min=0.01))
+                log_ct = torch.log(card_target.clamp(min=0.01))
+                card_ent_loss = self.card_ent_coef * (log_ce - log_ct).pow(2).mean()
+            else:
+                card_ent_loss = torch.tensor(0.0, device=self.device)
+
+            entropy_loss = type_ent_loss + card_ent_loss
+            entropy_mean = type_entropy.mean()
 
             loss = policy_loss + self.vf_coef * value_loss + entropy_loss
 
@@ -407,17 +434,19 @@ class BalatroTrainer:
 
             total_policy_loss += policy_loss.item()
             total_value_loss += value_loss.item()
-            total_entropy += entropy_mean.item()
+            total_entropy += (type_entropy.mean() + card_entropy.mean()).item()
+            total_type_entropy += type_entropy.mean().item()
+            total_card_entropy += card_entropy.mean().item()
             total_approx_kl += approx_kl
             total_clip_frac += clip_frac
             total_grad_norm += grad_norm.item()
             total_max_ratio = max(total_max_ratio, batch_max_ratio)
             total_lr_clipped_frac += batch_lr_clipped_frac
-            total_entropy_deviation += abs(entropy_mean.item() - self.entropy_target)
+            total_entropy_deviation += (log_type_ent - log_type_target).abs().mean().item()
             n_batches += 1
 
             # Per-minibatch KL check: bail out mid-epoch on catastrophic divergence
-            if approx_kl > 0.2:
+            if approx_kl > 0.1:
                 break
 
         n_batches = max(n_batches, 1)
@@ -425,6 +454,8 @@ class BalatroTrainer:
             "policy_loss": total_policy_loss / n_batches,
             "value_loss": total_value_loss / n_batches,
             "entropy": total_entropy / n_batches,
+            "type_entropy": total_type_entropy / n_batches,
+            "card_entropy": total_card_entropy / n_batches,
             "approx_kl": total_approx_kl / n_batches,
             "clip_fraction": total_clip_frac / n_batches,
             "grad_norm": total_grad_norm / n_batches,
@@ -492,6 +523,8 @@ class BalatroTrainer:
             self.writer.add_scalar("train/policy_loss", epoch_stats["policy_loss"], global_step)
             self.writer.add_scalar("train/value_loss", epoch_stats["value_loss"], global_step)
             self.writer.add_scalar("train/entropy", epoch_stats["entropy"], global_step)
+            self.writer.add_scalar("train/type_entropy", epoch_stats["type_entropy"], global_step)
+            self.writer.add_scalar("train/card_entropy", epoch_stats["card_entropy"], global_step)
             self.writer.add_scalar("train/approx_kl", epoch_stats["approx_kl"], global_step)
             self.writer.add_scalar("train/clip_fraction", epoch_stats["clip_fraction"], global_step)
             self.writer.add_scalar("train/learning_rate", current_lr, global_step)
@@ -549,7 +582,7 @@ class BalatroTrainer:
                     f"epochs={epochs_used}/{self.n_epochs} | "
                     f"ploss={epoch_stats['policy_loss']:.4f} "
                     f"vloss={epoch_stats['value_loss']:.4f} "
-                    f"ent={epoch_stats['entropy']:.3f} "
+                    f"ent={epoch_stats['type_entropy']:.3f}/{epoch_stats['card_entropy']:.3f} "
                     f"kl={epoch_stats['approx_kl']:.4f}"
                     f"{ep_info}"
                 )
