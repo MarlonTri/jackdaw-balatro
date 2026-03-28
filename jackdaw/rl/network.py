@@ -351,12 +351,16 @@ class FactoredPolicy(nn.Module):
             # Dot-product scoring: content-based card selection
             card_logits = (q.unsqueeze(1) * hand_embeds).sum(-1) / (q.shape[-1] ** 0.5)
 
-            # Best-hand card bias: directly boost cards that form the best hand
+            # Best-hand card bias: boost best-hand cards for PlayHand, invert for Discard
             # Feature 13 = is_best_hand_card, Feature 14 = n_matching_rank_peers
             raw_hand = obs["hand_card"][idx]  # (n, max_hand, feat_dim)
             is_best = raw_hand[:, :max_hand, 13]  # (n, max_hand)
             n_peers = raw_hand[:, :max_hand, 14]  # (n, max_hand)
-            card_logits = card_logits + 2.0 * is_best + 1.0 * n_peers
+            hand_bias = 2.0 * is_best + 1.0 * n_peers
+            # Flip bias for Discard: select bad cards to discard, keep good ones
+            bias_sign = torch.ones(len(idx), 1, device=device)
+            bias_sign[action_type[idx] == 1] = -1.0  # ActionType.Discard = 1
+            card_logits = card_logits + bias_sign * hand_bias
 
             cmask = action_masks["card_mask"][idx]  # (n, max_hand) bool
             # Clamp logits before masking to prevent overflow
@@ -500,11 +504,14 @@ class FactoredPolicy(nn.Module):
             # Dot-product scoring: content-based card selection
             card_logits = (q.unsqueeze(1) * hand_embeds).sum(-1) / (q.shape[-1] ** 0.5)
 
-            # Best-hand card bias (same as forward)
+            # Best-hand card bias (same as forward — flip for Discard)
             raw_hand = obs["hand_card"][idx]
             is_best = raw_hand[:, :max_hand, 13]
             n_peers = raw_hand[:, :max_hand, 14]
-            card_logits = card_logits + 2.0 * is_best + 1.0 * n_peers
+            hand_bias = 2.0 * is_best + 1.0 * n_peers
+            bias_sign = torch.ones(len(idx), 1, device=device)
+            bias_sign[action_type[idx] == 1] = -1.0
+            card_logits = card_logits + bias_sign * hand_bias
 
             cmask = action_masks["card_mask"][idx]
             # Ensure selected cards are in mask (handles stale masks)
