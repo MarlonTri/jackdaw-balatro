@@ -313,20 +313,24 @@ class FactoredBalatroEnv:
 
     def _compute_reward(self, info: dict[str, Any], terminated: bool, truncated: bool) -> float:
         """Same reward logic as gymnasium_wrapper._compute_reward."""
+        gs: dict[str, Any] = info.get("raw_state", {})
+
+        # Always track ante/round (even with reward_shaping=False for eval)
+        ante = gs.get("round_resets", {}).get("ante", 1)
+        round_num = gs.get("round", 0)
+        self._episode_max_ante = max(self._episode_max_ante, ante)
+        self._episode_max_round = max(self._episode_max_round, round_num)
+
         if not self._reward_shaping:
             if terminated or truncated:
                 return 1.0 if self._inner.episode_won else -1.0
             return 0.0
-
-        gs: dict[str, Any] = info.get("raw_state", {})
 
         # Base step cost (uniform — shop exploration is valuable)
         from jackdaw.engine.actions import GamePhase
         phase = gs.get("phase")
         reward = -0.001
 
-        ante = gs.get("round_resets", {}).get("ante", 1)
-        round_num = gs.get("round", 0)
         chips = gs.get("chips", 0)
 
         if round_num > self._prev_round:
