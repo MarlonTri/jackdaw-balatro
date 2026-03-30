@@ -464,14 +464,20 @@ class BalatroTrainer:
             "entropy_deviation": total_entropy_deviation / n_batches,
         }
 
-    def load_checkpoint(self, path: str) -> int:
-        """Load a checkpoint and return the global step to resume from."""
+    def load_checkpoint(self, path: str, reset_schedule: bool = False) -> int:
+        """Load a checkpoint and return the global step to resume from.
+
+        If reset_schedule is True, only loads network weights — optimizer
+        and LR scheduler start fresh (useful for breaking plateaus).
+        """
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.network.load_state_dict(ckpt["network"])
-        self.optimizer.load_state_dict(ckpt["optimizer"])
-        self.lr_scheduler.load_state_dict(ckpt["scheduler"])
+        if not reset_schedule:
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+            self.lr_scheduler.load_state_dict(ckpt["scheduler"])
         global_step = ckpt["global_step"]
-        print(f"Resumed from checkpoint: {path} (global_step={global_step})")
+        sched_info = " (fresh optimizer/scheduler)" if reset_schedule else ""
+        print(f"Resumed from checkpoint: {path} (global_step={global_step}){sched_info}")
         return global_step
 
     def train(

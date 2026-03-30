@@ -59,6 +59,7 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--save-path", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt file")
+    parser.add_argument("--reset-schedule", action="store_true", help="Fresh optimizer/LR on resume")
     parser.add_argument("--checkpoint-interval", type=int, default=50)
     args = parser.parse_args()
 
@@ -100,7 +101,7 @@ def main() -> None:
 
     resume_step = 0
     if args.resume:
-        resume_step = trainer.load_checkpoint(args.resume)
+        resume_step = trainer.load_checkpoint(args.resume, reset_schedule=args.reset_schedule)
 
     trainer.train(total_timesteps=args.total_timesteps, resume_step=resume_step)
 
