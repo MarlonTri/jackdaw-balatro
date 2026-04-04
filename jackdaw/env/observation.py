@@ -354,7 +354,7 @@ _DEBUFF_SUIT_IDX: dict[str, int] = {
 # ---------------------------------------------------------------------------
 
 D_PLAYING_CARD: int = 15
-D_JOKER: int = _N_JOKER_SEMANTIC + 12  # 17 semantic + 12 runtime = 29
+D_JOKER: int = _N_JOKER_SEMANTIC + 13  # 17 semantic + 13 runtime = 30
 D_CONSUMABLE: int = 7
 D_SHOP: int = 20
 # Global layout:
@@ -380,10 +380,31 @@ D_SHOP: int = 20
 #   [232]      debuff_hand_fraction (1) — fraction of hand cards debuffed by boss blind
 #   [233]      spendable_above_interest (1) — money above interest floor, log-scaled
 #   [234]      urgency (1) — blind_remaining / (base_score × hands_left), clamped
+#   --- deck composition & scaling features ---
+#   [235:239]  deck_suit_distribution (4) — fraction of each suit in remaining deck
+#   [239:252]  deck_rank_distribution (13) — fraction of each rank in remaining deck
+#   [252]      total_xmult (1) — product of all x_mult from jokers, log-scaled
+#   [253]      total_additive_mult (1) — sum of all additive mult from jokers, log-scaled
+#   [254]      deck_thinning (1) — deck_size / 52
 _D_BASE: int = 6 + 4 + 20 + NUM_HAND_TYPES * 5  # 90
 _D_OLD_GLOBAL: int = _D_BASE + NUM_VOUCHERS + 8 + 3 + 2 + NUM_TAGS + D_DISCARD_HISTOGRAM  # 211
-_D_STRATEGIC: int = NUM_HAND_TYPES + 3 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1  # 24
-D_GLOBAL: int = _D_OLD_GLOBAL + _D_STRATEGIC  # 235
+_D_STRATEGIC: int = (
+    NUM_HAND_TYPES  # hand type indicators (12)
+    + 3  # base score (chips, mult, chips*mult)
+    + 1  # score-to-blind ratio
+    + 2  # flush/straight proximity
+    + 1  # interest earned
+    + 2  # flush/straight draw outs
+    + 1  # debuff hand fraction
+    + 1  # spendable above interest
+    + 1  # urgency
+    + NUM_SUITS  # deck suit distribution (4)
+    + NUM_RANKS  # deck rank distribution (13)
+    + 1  # total xMult from jokers
+    + 1  # total additive mult
+    + 1  # deck thinning ratio
+)  # 44
+D_GLOBAL: int = _D_OLD_GLOBAL + _D_STRATEGIC  # 255
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +521,7 @@ def encode_joker(
 
     Returns shape ``(D_JOKER,)`` float32 array.
 
-    Features (29):
+    Features (30):
         0-16: semantic features from centers.json (category flags, target suit/hand type, rarity)
         17: edition (ordinal 0-4, normalized /4)
         18: sell_value (log-scaled)
@@ -514,6 +535,7 @@ def encode_joker(
         26: ability_x_mult (raw — typically 1-5)
         27: ability_chips (log-scaled)
         28: condition_met (0/1 — simplified: not debuffed)
+        29: center_key_id (raw integer for learned embedding lookup in network)
     """
     v = np.zeros(D_JOKER, dtype=np.float32)
     S = _N_JOKER_SEMANTIC  # 17
@@ -536,6 +558,7 @@ def encode_joker(
     v[S + 9] = card.ability.get("x_mult", 1.0)
     v[S + 10] = _log_scale(card.ability.get("t_chips", 0) + card.ability.get("bonus", 0))
     v[S + 11] = float(not card.debuff)
+    v[S + 12] = float(center_key_id(card.center_key))  # raw ID for embedding lookup
 
     return v
 
@@ -1048,6 +1071,55 @@ def encode_global_context(gs: dict[str, Any]) -> np.ndarray:
         urgency = blind_remaining / (base_score_val * hands_left)
         v[urg_base] = min(urgency, 5.0) / 5.0
 
+    # --- Deck composition & scaling features [235:255] ---
+    dcbase = urg_base + 1  # 235
+
+    # Deck suit distribution [235:239]
+    # (reuses `deck` already fetched above for draw-out features)
+    d_size = max(len(deck), 1)
+    d_suit_counts = [0, 0, 0, 0]
+    d_rank_counts = [0] * NUM_RANKS
+    for dcard in deck:
+        cb = getattr(dcard, "base", None)
+        if cb is None:
+            continue
+        d_suit_str = cb.suit.value if hasattr(cb.suit, "value") else str(cb.suit)
+        d_rank_str = cb.rank.value if hasattr(cb.rank, "value") else str(cb.rank)
+        dsi = _SUIT_IDX.get(d_suit_str)
+        dri = _RANK_IDX.get(d_rank_str)
+        if dsi is not None:
+            d_suit_counts[dsi] += 1
+        if dri is not None:
+            d_rank_counts[dri] += 1
+
+    for i in range(NUM_SUITS):
+        v[dcbase + i] = d_suit_counts[i] / d_size
+
+    # Deck rank distribution [239:252]
+    rk_base = dcbase + NUM_SUITS  # 239
+    for i in range(NUM_RANKS):
+        v[rk_base + i] = d_rank_counts[i] / d_size
+
+    # Total xMult from jokers [252]
+    xm_base = rk_base + NUM_RANKS  # 252
+    total_xmult = 1.0
+    total_add_mult = 0.0
+    for joker in jokers:
+        xm = joker.ability.get("x_mult", 1.0)
+        big_xm = joker.ability.get("Xmult", 1.0)
+        effective_xm = max(xm, big_xm)
+        if effective_xm > 1.0:
+            total_xmult *= effective_xm
+        m = joker.ability.get("mult", 0) + joker.ability.get("t_mult", 0)
+        total_add_mult += m
+    v[xm_base] = _log_scale(total_xmult)
+
+    # Total additive mult from jokers [253]
+    v[xm_base + 1] = _log_scale(total_add_mult)
+
+    # Deck thinning ratio [254]
+    v[xm_base + 2] = len(deck) / 52.0
+
     return v
 
 
@@ -1185,6 +1257,7 @@ def encode_jokers_batch(
         row[S + 9] = card.ability.get("x_mult", 1.0)
         row[S + 10] = _log_scale(card.ability.get("t_chips", 0) + card.ability.get("bonus", 0))
         row[S + 11] = float(not card.debuff)
+        row[S + 12] = float(center_key_id(card.center_key))  # raw ID for embedding
 
     return buf.copy()
 

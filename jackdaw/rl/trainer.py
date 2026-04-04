@@ -9,6 +9,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 from jackdaw.env.balatro_spec import balatro_game_spec
@@ -17,6 +18,7 @@ from jackdaw.rl.network import (
     ENTITY_MAX_COUNTS,
     NEEDS_CARDS,
     NEEDS_ENTITY,
+    NUM_ACTION_TYPES,
     FactoredPolicy,
 )
 from jackdaw.rl.rollout import RolloutBuffer, Transition
@@ -139,7 +141,7 @@ class BalatroTrainer:
         ent_coef: float = 0.2,
         entropy_target: float = 2.0,
         card_ent_coef: float = 0.02,
-        vf_coef: float = 0.5,
+        vf_coef: float = 1.0,
         n_steps: int = 4096,
         n_epochs: int = 10,
         batch_size: int = 512,
@@ -148,6 +150,7 @@ class BalatroTrainer:
         log_dir: str = "runs/balatro_factored",
         total_timesteps: int = 5_000_000,
         checkpoint_interval: int = 50,
+        value_warmup: int = 0,
     ) -> None:
         self.vec_env = vec_env
         self.n_envs = vec_env.n_envs
@@ -165,6 +168,7 @@ class BalatroTrainer:
         self.max_grad_norm = max_grad_norm
         self.log_dir = log_dir
         self.checkpoint_interval = checkpoint_interval
+        self.value_warmup = value_warmup
 
         if device == "auto":
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -191,11 +195,17 @@ class BalatroTrainer:
         self._ep_wins: list[bool] = []
         self._recent_wins: deque[bool] = deque(maxlen=100)
 
+        # Action type distribution tracking
+        self._ep_action_counts: list[np.ndarray] = []  # per-episode action histograms
+
         # Per-env state
         self._env_obs: list[dict[str, np.ndarray] | None] = [None] * self.n_envs
         self._env_masks: list[GameActionMask | None] = [None] * self.n_envs
         self._env_ep_reward: list[float] = [0.0] * self.n_envs
         self._env_ep_len: list[int] = [0] * self.n_envs
+        self._env_action_counts: list[np.ndarray] = [
+            np.zeros(NUM_ACTION_TYPES, dtype=np.int32) for _ in range(self.n_envs)
+        ]
 
     def _reset_all(self) -> None:
         """Reset all environments."""
@@ -205,6 +215,7 @@ class BalatroTrainer:
             self._env_masks[i] = mask_list[i]
             self._env_ep_reward[i] = 0.0
             self._env_ep_len[i] = 0
+            self._env_action_counts[i][:] = 0
 
     def collect_rollout(self) -> tuple[RolloutBuffer, list[float]]:
         """Collect n_steps transitions across all environments.
@@ -285,10 +296,12 @@ class BalatroTrainer:
 
                 self._env_ep_reward[i] += reward
                 self._env_ep_len[i] += 1
+                self._env_action_counts[i][int(action_types[i])] += 1
 
                 if done:
                     self._ep_rewards.append(self._env_ep_reward[i])
                     self._ep_lengths.append(self._env_ep_len[i])
+                    self._ep_action_counts.append(self._env_action_counts[i].copy())
                     if terminal_info:
                         self._ep_antes.append(terminal_info.get("balatro/ante_reached", 1))
                         self._ep_rounds.append(terminal_info.get("balatro/rounds_beaten", 0))
@@ -300,6 +313,7 @@ class BalatroTrainer:
                     self._env_masks[i] = new_mask
                     self._env_ep_reward[i] = 0.0
                     self._env_ep_len[i] = 0
+                    self._env_action_counts[i][:] = 0
                 else:
                     self._env_obs[i] = obs
                     self._env_masks[i] = mask
@@ -314,7 +328,7 @@ class BalatroTrainer:
 
         return buf, last_values
 
-    def train_epoch(self, data: dict[str, Any]) -> dict[str, float]:
+    def train_epoch(self, data: dict[str, Any], value_only: bool = False) -> dict[str, float]:
         """One epoch of PPO updates over the buffer."""
         self.network.train()
         N = data["action_type"].shape[0]
@@ -377,13 +391,13 @@ class BalatroTrainer:
             surr2 = ratio.clamp(1.0 - self.clip_range, 1.0 + self.clip_range) * adv_b
             policy_loss = -torch.min(surr1, surr2).mean()
 
-            # Clipped value loss
+            # Clipped value loss (Huber — robust to outlier returns)
             old_val_b = data["old_values"][idx_t]
             value_clipped = old_val_b + (new_val - old_val_b).clamp(
                 -self.clip_range, self.clip_range
             )
-            value_loss_unclipped = (new_val - ret_b).pow(2)
-            value_loss_clipped = (value_clipped - ret_b).pow(2)
+            value_loss_unclipped = F.smooth_l1_loss(new_val, ret_b, reduction="none")
+            value_loss_clipped = F.smooth_l1_loss(value_clipped, ret_b, reduction="none")
             value_loss = torch.max(value_loss_unclipped, value_loss_clipped).mean()
 
             # Adaptive entropy targeting in log-space (stronger gradient near collapse)
@@ -413,7 +427,10 @@ class BalatroTrainer:
             entropy_loss = type_ent_loss + card_ent_loss
             entropy_mean = type_entropy.mean()
 
-            loss = policy_loss + self.vf_coef * value_loss + entropy_loss
+            if value_only:
+                loss = self.vf_coef * value_loss
+            else:
+                loss = policy_loss + self.vf_coef * value_loss + entropy_loss
 
             if torch.isnan(loss) or torch.isinf(loss):
                 continue
@@ -467,15 +484,27 @@ class BalatroTrainer:
     def load_checkpoint(self, path: str, reset_schedule: bool = False) -> int:
         """Load a checkpoint and return the global step to resume from.
 
+        Accepts either a full trainer checkpoint (with optimizer/scheduler)
+        or a raw state_dict (e.g., from behavioral cloning).
+
         If reset_schedule is True, only loads network weights — optimizer
         and LR scheduler start fresh (useful for breaking plateaus).
         """
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.network.load_state_dict(ckpt["network"])
-        if not reset_schedule:
-            self.optimizer.load_state_dict(ckpt["optimizer"])
-            self.lr_scheduler.load_state_dict(ckpt["scheduler"])
-        global_step = ckpt["global_step"]
+
+        # Detect format: trainer checkpoint has "network" key, BC has layer keys
+        if "network" in ckpt:
+            self.network.load_state_dict(ckpt["network"])
+            if not reset_schedule:
+                self.optimizer.load_state_dict(ckpt["optimizer"])
+                self.lr_scheduler.load_state_dict(ckpt["scheduler"])
+            global_step = ckpt["global_step"]
+        else:
+            # Raw state_dict (e.g., from behavioral cloning)
+            self.network.load_state_dict(ckpt)
+            global_step = 0
+            reset_schedule = True
+
         sched_info = " (fresh optimizer/scheduler)" if reset_schedule else ""
         print(f"Resumed from checkpoint: {path} (global_step={global_step}){sched_info}")
         return global_step
@@ -510,12 +539,14 @@ class BalatroTrainer:
             n_episodes = len(self._ep_rewards)
 
             # PPO epochs with KL early stopping
+            # During value warmup: only train value head, freeze policy
+            is_warmup = self.value_warmup > 0 and update <= self.value_warmup
             epoch_stats: dict[str, float] = {}
             epochs_used = 0
             for epoch_idx in range(self.n_epochs):
-                epoch_stats = self.train_epoch(data)
+                epoch_stats = self.train_epoch(data, value_only=is_warmup)
                 epochs_used = epoch_idx + 1
-                if epoch_stats["approx_kl"] > 0.1:
+                if not is_warmup and epoch_stats["approx_kl"] > 0.1:
                     break
 
             # Step LR scheduler
@@ -571,14 +602,44 @@ class BalatroTrainer:
                     global_step,
                 )
 
+            # Log action type distribution
+            if self._ep_action_counts:
+                mean_counts = np.mean(self._ep_action_counts, axis=0)
+                total = mean_counts.sum()
+                if total > 0:
+                    _ACTION_NAMES = [
+                        "PlayHand", "Discard", "SelectBlind", "SkipBlind",
+                        "CashOut", "Reroll", "NextRound", "SkipPack",
+                        "BuyCard", "SellJoker", "SellConsumable", "UseConsumable",
+                        "RedeemVoucher", "OpenBooster", "PickPackCard",
+                        "SwapJokersL", "SwapJokersR", "SwapHandL", "SwapHandR",
+                        "SortRank", "SortSuit",
+                    ]
+                    for i, name in enumerate(_ACTION_NAMES):
+                        if mean_counts[i] > 0.01:
+                            self.writer.add_scalar(
+                                f"actions/{name}", mean_counts[i] / total, global_step
+                            )
+
             # Console output
             if update % log_interval == 0:
                 ep_info = ""
+                act_info = ""
+                if self._ep_action_counts:
+                    mc = np.mean(self._ep_action_counts, axis=0)
+                    t = mc.sum()
+                    if t > 0:
+                        play_pct = mc[0] / t * 100
+                        disc_pct = mc[1] / t * 100
+                        buy_pct = mc[8] / t * 100
+                        nxt_pct = mc[6] / t * 100
+                        act_info = f" P={play_pct:.0f}% D={disc_pct:.0f}% B={buy_pct:.0f}% N={nxt_pct:.0f}%"
                 if self._ep_rewards:
                     ep_info = (
                         f" | ep_rew={np.mean(self._ep_rewards):.3f}"
                         f" ep_len={np.mean(self._ep_lengths):.0f}"
                         f" ante={np.mean(self._ep_antes):.1f}"
+                        f"{act_info}"
                     )
                 print(
                     f"Update {update}/{num_updates} | "
@@ -612,6 +673,7 @@ class BalatroTrainer:
             self._ep_antes.clear()
             self._ep_rounds.clear()
             self._ep_wins.clear()
+            self._ep_action_counts.clear()
 
             buf.clear()
 

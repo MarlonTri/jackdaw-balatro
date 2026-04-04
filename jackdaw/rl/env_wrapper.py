@@ -18,6 +18,7 @@ from typing import Any
 
 import numpy as np
 
+from jackdaw.engine.data.hands import HAND_BASE
 from jackdaw.engine.game import IllegalActionError
 from jackdaw.env.action_space import ActionType, get_consumable_target_info
 from jackdaw.env.balatro_env import BalatroEnvironment
@@ -210,7 +211,7 @@ class FactoredBalatroEnv:
         )
         self._reward_shaping = reward_shaping
         self._shop_splits: tuple[int, int, int] = (0, 0, 0)
-        self.max_episode_steps = 400
+        self.max_episode_steps = 1200
         self._step_count = 0
 
         # Reward-shaping trackers
@@ -221,6 +222,9 @@ class FactoredBalatroEnv:
         self._episode_max_ante: int = 1
         self._episode_max_round: int = 0
         self._prev_joker_count: int = 0
+        self._prev_consumable_count: int = 0
+        self._prev_hand_levels_sum: int = 12  # 12 hand types × level 1
+        self._prev_scoring_potential: float = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -237,6 +241,9 @@ class FactoredBalatroEnv:
         self._episode_max_ante = 1
         self._episode_max_round = 0
         self._prev_joker_count = 0
+        self._prev_consumable_count = 0
+        self._prev_hand_levels_sum = 12
+        self._prev_scoring_potential = 0.0
         self._shop_splits = info.get("shop_splits", (0, 0, 0))
         game_mask = _remap_shop_masks(game_mask, self._shop_splits)
         obs = self._build_obs(game_obs)
@@ -312,7 +319,19 @@ class FactoredBalatroEnv:
         return obs
 
     def _compute_reward(self, info: dict[str, Any], terminated: bool, truncated: bool) -> float:
-        """Same reward logic as gymnasium_wrapper._compute_reward."""
+        """Dense reward with ante-scaled signals and potential-based progression.
+
+        Design principles:
+        - Ante progression is the primary objective (quadratic potential)
+        - Blind-beaten rewards scale with ante (harder blinds = more reward)
+        - Joker acquisition and hand-level-ups provide intermediate signal
+          for actions whose benefits are delayed
+        - Economy incentives encourage interest-tier maintenance
+        - Terminal reward scales with ante reached to create smooth gradient
+        """
+        import math
+        from jackdaw.engine.actions import GamePhase
+
         gs: dict[str, Any] = info.get("raw_state", {})
 
         # Always track ante/round (even with reward_shaping=False for eval)
@@ -326,63 +345,112 @@ class FactoredBalatroEnv:
                 return 1.0 if self._inner.episode_won else -1.0
             return 0.0
 
-        # Base step cost (uniform — shop exploration is valuable)
-        from jackdaw.engine.actions import GamePhase
         phase = gs.get("phase")
-        reward = -0.001
-
         chips = gs.get("chips", 0)
+        dollars = gs.get("dollars", 0)
+        n_jokers = len(gs.get("jokers", []))
+        n_consumables = len(gs.get("consumables", []))
 
+        # Compute total hand levels (detect planet card usage)
+        hand_levels_sum = 12  # default: 12 types × level 1
+        hl = gs.get("hand_levels")
+        if hl is not None:
+            hand_levels_sum = sum(h.level for h in hl._hands.values())
+
+        reward = 0.0
+
+        # --- Ante progression (potential-based: quadratic, strong) ---
+        if ante > self._prev_ante:
+            reward += (ante ** 2 - self._prev_ante ** 2) / 8.0
+
+        # --- Blind beaten (ante-scaled — harder blinds worth more) ---
         if round_num > self._prev_round:
-            reward += 0.25 * max(ante / 4, 0.5)
-            if ante > self._prev_ante:
-                reward += 0.3 * ante
+            reward += 0.05 * ante
             hands_left = gs.get("current_round", {}).get("hands_left", 0)
-            reward += 0.03 * hands_left
+            reward += 0.02 * hands_left
 
+        # --- Chip progress (linear, normalized to blind target) ---
         blind = gs.get("blind")
         blind_target = getattr(blind, "chips", 0) if blind is not None else 0
         if blind_target > 0 and chips > self._prev_chips:
             chip_delta = chips - self._prev_chips
-            progress = chip_delta / blind_target
-            reward += 0.10 * min(progress, 1.0)
-            # Over-clearing bonus: reward high-scoring hands
-            if progress > 1.0:
-                reward += 0.05 * min(progress - 1.0, 3.0)
-            # Hand quality bonus: graduated reward for stronger poker hands
-            if chip_delta >= 200:
-                reward += 0.15  # flush, full house, or better
-            elif chip_delta >= 80:
-                reward += 0.08  # three of a kind, straight
-            elif chip_delta >= 30:
-                reward += 0.04  # two pair, good pair
-            elif chip_delta >= 10:
-                reward += 0.02  # basic pair
+            progress = min(chip_delta / blind_target, 1.0)
+            reward += 0.20 * progress
 
-        # Joker acquisition bonus: strong but balanced
-        n_jokers = len(gs.get("jokers", []))
-        if n_jokers > self._prev_joker_count:
-            reward += 0.30 * (n_jokers - self._prev_joker_count)
+        # --- Scoring potential (potential-based: rewards build improvements) ---
+        # Computes max(base_hand_score) × joker_multipliers
+        # Changes when: buying/selling jokers, leveling hand types, card enhancements
+        scoring_potential = self._compute_scoring_potential(gs)
+        if scoring_potential > 0 and self._prev_scoring_potential > 0:
+            ratio = scoring_potential / self._prev_scoring_potential
+            if ratio > 1.01:  # meaningful improvement
+                reward += 0.30 * math.log(ratio)
+            elif ratio < 0.99:  # meaningful regression (sold joker, etc.)
+                reward += 0.30 * math.log(ratio)  # negative
 
-        # Shop purchase bonus: encourage spending on items
-        dollars = gs.get("dollars", 0)
-        if phase == GamePhase.SHOP and dollars < self._prev_dollars:
-            money_spent = self._prev_dollars - dollars
-            reward += 0.05 * min(money_spent, 10)  # up to +0.50 for big purchases
+        # --- Hand level improvement (planet cards — also captured above) ---
+        if hand_levels_sum > self._prev_hand_levels_sum:
+            levels_gained = hand_levels_sum - self._prev_hand_levels_sum
+            reward += 0.10 * levels_gained
 
-        # Economy signal: gentle pull toward saving for interest
-        if dollars >= 5:
-            reward += 0.001 * min(dollars // 5, 5)
+        # --- Consumable usage (tarots enhance cards) ---
+        if n_consumables < self._prev_consumable_count:
+            reward += 0.05 * (self._prev_consumable_count - n_consumables)
 
+        # --- Economy (interest incentive — maintaining $5 tiers) ---
+        if phase == GamePhase.SHOP and dollars >= 5:
+            reward += 0.005 * min(dollars // 5, 5)
+
+        # --- Terminal (ante-scaled: smooth gradient for progression) ---
         if terminated or truncated:
-            reward += 1.0 if self._inner.episode_won else -0.3
+            if self._inner.episode_won:
+                reward += 5.0
+            else:
+                # Ante 1: -1.65, Ante 4: -0.60, Ante 7: +0.45
+                reward += -2.0 + self._episode_max_ante * 0.35
 
         self._prev_round = round_num
         self._prev_ante = ante
         self._prev_chips = chips
         self._prev_dollars = dollars
         self._prev_joker_count = n_jokers
-        self._episode_max_ante = max(self._episode_max_ante, ante)
-        self._episode_max_round = max(self._episode_max_round, round_num)
+        self._prev_consumable_count = n_consumables
+        self._prev_hand_levels_sum = hand_levels_sum
+        self._prev_scoring_potential = scoring_potential
 
         return reward
+
+    @staticmethod
+    def _compute_scoring_potential(gs: dict[str, Any]) -> float:
+        """Estimate max achievable score from current build (jokers + hand levels).
+
+        Returns best_hand_base_score × (1 + joker_add_mult) × joker_xmult.
+        This is a stable measure of build strength — only changes when
+        jokers are bought/sold or hand types are leveled up.
+        """
+        hand_levels = gs.get("hand_levels")
+        jokers = gs.get("jokers", [])
+
+        # Best hand type base score across all 12 types at current levels
+        best_base = 0.0
+        if hand_levels is not None:
+            for ht, hs in hand_levels._hands.items():
+                base = HAND_BASE[ht]
+                score = base.chips_at(hs.level) * base.mult_at(hs.level)
+                if score > best_base:
+                    best_base = score
+
+        if best_base == 0:
+            return 0.0
+
+        # Joker multiplier contributions
+        total_add_mult = 0.0
+        total_xmult = 1.0
+        for joker in jokers:
+            ab = joker.ability
+            xm = max(ab.get("x_mult", 1.0), ab.get("Xmult", 1.0))
+            if xm > 1.0:
+                total_xmult *= xm
+            total_add_mult += ab.get("mult", 0) + ab.get("t_mult", 0)
+
+        return best_base * (1.0 + total_add_mult) * total_xmult

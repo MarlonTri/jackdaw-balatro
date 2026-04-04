@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 
 from jackdaw.env.balatro_spec import balatro_game_spec
+from jackdaw.env.observation import NUM_CENTER_KEYS
 
 _SPEC = balatro_game_spec()
 
@@ -48,16 +49,16 @@ HAND_CARD_IDX = 0  # hand_card entity type index
 D_GLOBAL = _SPEC.global_feature_dim  # 235
 
 # Encoder output dims
-GLOBAL_EMBED = 128
-ENTITY_EMBED = 96  # all entity types (unified for cross-attention)
-STATE_EMBED = 384
+GLOBAL_EMBED = 192
+ENTITY_EMBED = 128  # all entity types (unified for cross-attention)
+STATE_EMBED = 512
 
 POINTER_DIM = 64  # query/key dim for pointer attention
 
 # Cross-entity attention config
-NUM_ATTN_LAYERS = 2
+NUM_ATTN_LAYERS = 4
 NUM_ATTN_HEADS = 4
-ATTN_FFN_DIM = 128
+ATTN_FFN_DIM = 256
 MAX_ENTITIES = sum(et.max_count for et in _SPEC.entity_types)  # 30
 
 # Logits are clamped to [-_LOGIT_CLAMP, _LOGIT_CLAMP] before masking, then
@@ -102,11 +103,11 @@ class FactoredPolicy(nn.Module):
     """Factored actor-critic for Balatro.
 
     Observation format (dict of tensors, batch dim first):
-        "global":        (B, 235)
+        "global":        (B, 255)
         "hand_card":     (B, 8, 15)
-        "joker":         (B, 5, 15)
+        "joker":         (B, 5, 30)
         "consumable":    (B, 2, 7)
-        "shop_item":     (B, 10, 9)
+        "shop_item":     (B, 10, 20)
         "pack_card":     (B, 5, 15)
         "entity_counts": (B, 5)
     """
@@ -117,7 +118,12 @@ class FactoredPolicy(nn.Module):
         # --- Entity encoders (separate weights per type, unified output dim) ---
         self.entity_encoders = nn.ModuleDict()
         for i, (name, _, feat_dim) in enumerate(_ENTITY_INFO):
-            self.entity_encoders[name] = _mlp(feat_dim, ENTITY_EMBED, ENTITY_EMBED)
+            # Joker encoder excludes last feature (center_key_id used for embedding)
+            enc_dim = feat_dim - 1 if name == "joker" else feat_dim
+            self.entity_encoders[name] = _mlp(enc_dim, ENTITY_EMBED, ENTITY_EMBED)
+
+        # --- Learned joker identity embedding (looked up by center_key_id) ---
+        self.joker_id_embed = nn.Embedding(NUM_CENTER_KEYS + 1, ENTITY_EMBED)
 
         # --- Global encoder ---
         self.global_encoder = _mlp(D_GLOBAL, GLOBAL_EMBED, GLOBAL_EMBED)
@@ -155,13 +161,14 @@ class FactoredPolicy(nn.Module):
         # Dot-product scoring: query · card_embed (content-based, no positional bias)
         self.card_query = nn.Linear(STATE_EMBED, ENTITY_EMBED)
 
-        # --- Value head ---
+        # --- Value head (LayerNorm for stable value estimation) ---
         self.value_head = nn.Sequential(
-            nn.Linear(STATE_EMBED, 128),
+            nn.LayerNorm(STATE_EMBED),
+            nn.Linear(STATE_EMBED, 256),
             nn.ReLU(),
-            nn.Linear(128, 64),
+            nn.Linear(256, 256),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(256, 1),
         )
 
         self._init_weights()
@@ -202,7 +209,13 @@ class FactoredPolicy(nn.Module):
 
         for i, (name, max_count, _) in enumerate(_ENTITY_INFO):
             raw = obs[name]  # (B, max_count, feat_dim)
-            embed = self.entity_encoders[name](raw)  # (B, max_count, ENTITY_EMBED)
+            if name == "joker":
+                # Split continuous features and center_key_id for embedding lookup
+                cont = raw[:, :, :-1]  # (B, max_count, feat_dim - 1)
+                key_ids = raw[:, :, -1].long().clamp(0, NUM_CENTER_KEYS)
+                embed = self.entity_encoders[name](cont) + self.joker_id_embed(key_ids)
+            else:
+                embed = self.entity_encoders[name](raw)  # (B, max_count, ENTITY_EMBED)
             embed = embed + self.entity_type_embed.weight[i]  # add type embedding
             all_embeds.append(embed)
 
@@ -249,6 +262,58 @@ class FactoredPolicy(nn.Module):
         return state, entity_embeds
 
     # ------------------------------------------------------------------
+    # Domain-knowledge action biases
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_action_biases(obs: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Domain-knowledge logit biases for action types.
+
+        Similar to best-hand card bias — injects game knowledge to guide
+        exploration toward critical actions the agent struggles to discover.
+        """
+        B = obs["global"].shape[0]
+        device = obs["global"].device
+        bias = torch.zeros(B, NUM_ACTION_TYPES, device=device)
+
+        # --- BuyCard (8): strong bias for ANY affordable item with slot ---
+        is_shop = obs["global"][:, 3]  # SHOP phase one-hot
+        shop = obs["shop_item"]  # (B, 10, 20)
+        is_affordable = shop[:, :, 2] > 0.5
+        has_slot = shop[:, :, 3] > 0.5
+        any_buyable = (is_affordable & has_slot).any(dim=1)
+        bias[:, 8] += is_shop * any_buyable.float() * 4.0
+
+        # --- OpenBooster (13): bias for affordable boosters ---
+        is_booster = (shop[:, :, 0] > 0.75) & (shop[:, :, 0] < 0.82)
+        buyable_booster = (is_booster & is_affordable).any(dim=1)
+        bias[:, 13] += is_shop * buyable_booster.float() * 3.0
+
+        # --- UseConsumable (11): strong bias when usable consumable held ---
+        is_hand = obs["global"][:, 1]  # SELECTING_HAND phase
+        cons = obs["consumable"]  # (B, 2, 7)
+        can_use_any = (cons[:, :, 3] > 0.5).any(dim=1)
+        bias[:, 11] += is_hand * can_use_any.float() * 3.0
+
+        # --- SellJoker (9): negative bias — keep jokers unless slots full ---
+        n_jokers = obs["entity_counts"][:, 1]
+        has_room = (n_jokers < 5).float()
+        bias[:, 9] -= has_room * 4.0
+
+        # --- SkipBlind (3): negative bias — almost never skip ---
+        bias[:, 3] -= 3.0
+
+        # --- Discard (1): bias when hand is weak relative to blind ---
+        # global[226] = score_to_blind_ratio (clamped log ratio)
+        # When ratio is low, the current best hand can't beat the blind
+        # → agent should discard weak cards to draw better ones
+        score_ratio = obs["global"][:, 226]
+        weak_hand = (score_ratio < 0.3).float()  # best hand < 30% of blind target
+        bias[:, 1] += is_hand * weak_hand * 3.0
+
+        return bias
+
+    # ------------------------------------------------------------------
     # Forward: sample actions
     # ------------------------------------------------------------------
 
@@ -280,6 +345,7 @@ class FactoredPolicy(nn.Module):
 
         # --- Action type ---
         type_logits = self.action_type_head(state).clamp(-_LOGIT_CLAMP, _LOGIT_CLAMP)
+        type_logits = type_logits + self._compute_action_biases(obs)
         type_mask = action_masks["type_mask"]  # (B, 21) bool
         type_logits = type_logits.masked_fill(~type_mask, _MASK_VALUE)
         type_dist = Categorical(logits=type_logits)
@@ -434,6 +500,7 @@ class FactoredPolicy(nn.Module):
 
         # --- Action type ---
         type_logits = self.action_type_head(state)
+        type_logits = type_logits + self._compute_action_biases(obs)
         type_mask = action_masks["type_mask"]
         # Ensure at least the chosen action type is unmasked (handles stale masks)
         one_hot = F.one_hot(action_type, NUM_ACTION_TYPES).bool()

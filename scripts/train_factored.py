@@ -43,24 +43,27 @@ def _make_env(max_steps: int, seed_prefix: str, env_idx: int) -> FactoredBalatro
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train Balatro with factored policy PPO")
-    parser.add_argument("--total-timesteps", type=int, default=5_000_000)
+    parser.add_argument("--total-timesteps", type=int, default=100_000_000)
     parser.add_argument("--log-dir", type=str, default="runs/balatro_factored")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-steps", type=int, default=10_000)
-    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--gamma", type=float, default=0.995)
+    parser.add_argument("--gae-lambda", type=float, default=0.97)
     parser.add_argument("--ent-coef", type=float, default=2.0)
     parser.add_argument("--entropy-target", type=float, default=0.6)
     parser.add_argument("--clip-range", type=float, default=0.1)
-    parser.add_argument("--n-steps", type=int, default=4096)
+    parser.add_argument("--n-steps", type=int, default=8192)
     parser.add_argument("--n-epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--batch-size", type=int, default=2048)
     parser.add_argument("--card-ent-coef", type=float, default=2.0)
-    parser.add_argument("--n-envs", type=int, default=4)
+    parser.add_argument("--n-envs", type=int, default=16)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--save-path", type=str, default=None)
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt file")
     parser.add_argument("--reset-schedule", action="store_true", help="Fresh optimizer/LR on resume")
     parser.add_argument("--checkpoint-interval", type=int, default=50)
+    parser.add_argument("--value-warmup", type=int, default=0, help="Updates of value-only training before PPO (for BC init)")
     args = parser.parse_args()
 
     # Seed everything
@@ -86,6 +89,8 @@ def main() -> None:
         vec_env=vec_env,
         network=network,
         lr=args.lr,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
         clip_range=args.clip_range,
         ent_coef=args.ent_coef,
         entropy_target=args.entropy_target,
@@ -97,6 +102,7 @@ def main() -> None:
         log_dir=args.log_dir,
         total_timesteps=args.total_timesteps,
         checkpoint_interval=args.checkpoint_interval,
+        value_warmup=args.value_warmup,
     )
 
     resume_step = 0
