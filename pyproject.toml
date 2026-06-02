@@ -23,8 +23,7 @@ build-backend = "setuptools.build_meta"
 include = ["jackdaw*"]
 
 [tool.setuptools.package-data]
-# Include all .json and .png files inside any package directory
-"*" = ["jackdaw/enginer/data*.json"]
+"*" = ["*.json"]
 
 [project.scripts]
 jackdaw = "jackdaw.cli.main:main"
